@@ -31,21 +31,34 @@ client.once('clientReady', async () => {
 });
 
 // --- FUNÇÃO AUXILIAR PARA PROCESSAR O PROMPT UNIFICADO ---
-async function processarPromptGeral({ channel, author, prompt, mentionedChannel, attachment }) {
+async function processarPromptGeral({ channel, author, prompt, mentionedChannel, attachment, channelId: directChannelId }) {
   const isImage = attachment && attachment.contentType && attachment.contentType.startsWith('image/');
   let promptComContexto = prompt || 'oii!';
 
-  // 1. Leitura de canal opcional
-  if (mentionedChannel) {
-    const permissions = mentionedChannel.permissionsFor(client.user);
-    if (permissions && permissions.has(PermissionFlagsBits.ViewChannel) && permissions.has(PermissionFlagsBits.ReadMessageHistory)) {
-      const history = await mentionedChannel.messages.fetch({ limit: 15 });
-      const formattedMessages = history
-        .map(m => `${m.author.username}: ${m.content} ${m.attachments.size > 0 ? '[mídia]' : ''}`)
-        .reverse()
-        .join('\n');
+  // Fallback seguro do ID do canal (trata DMs e interações sem objeto channel)
+  const channelId = directChannelId || channel?.id || author.id;
 
-      promptComContexto = `${prompt}\n\n[HISTÓRICO LIDO DO CANAL #${mentionedChannel.name}]:\n${formattedMessages}\n\nResponda ao usuário com base no histórico acima.`;
+  // 1. Leitura de canal opcional (apenas se o bot for membro e tiver permissão no canal)
+  if (mentionedChannel && typeof mentionedChannel.permissionsFor === 'function' && client.user) {
+    try {
+      const temPermissao = mentionedChannel.permissionsFor(client.user)?.has([
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.ReadMessageHistory
+      ]);
+
+      if (temPermissao && mentionedChannel.messages) {
+        const history = await mentionedChannel.messages.fetch({ limit: 15 });
+        const formattedMessages = history
+          .map(m => `${m.author.username}: ${m.content} ${m.attachments.size > 0 ? '[mídia]' : ''}`)
+          .reverse()
+          .join('\n');
+
+        if (formattedMessages) {
+          promptComContexto = `${prompt}\n\n[HISTÓRICO LIDO DO CANAL #${mentionedChannel.name}]:\n${formattedMessages}\n\nResponda ao usuário com base no histórico acima.`;
+        }
+      }
+    } catch (errChannel) {
+      console.warn(`[Canal] Ignorando leitura de #${mentionedChannel.name}:`, errChannel.message);
     }
   }
 
@@ -55,18 +68,18 @@ async function processarPromptGeral({ channel, author, prompt, mentionedChannel,
     promptComContexto += `\n\n[SISTEMA DE RPG]: Pedido: ${resultadoDado.qtd}d${resultadoDado.lados}. Resultados: [${resultadoDado.resultados.join(', ')}]. Total: ${resultadoDado.total}.`;
   }
 
-  // 3. Gestão de Memória de curto prazo
-  adicionarAMemoria(channel.id, 'user', `${author.username}: ${promptComContexto}`);
+  // 3. Gestão de Memória de curto prazo por canal/DM
+  adicionarAMemoria(channelId, 'user', `${author.username}: ${promptComContexto}`);
 
   const systemPrompt = obterSystemInstruction(author.id);
   const payloadMensagens = [
     { role: 'system', content: systemPrompt },
-    ...obterMemoria(channel.id)
+    ...obterMemoria(channelId)
   ];
 
   // 4. Execução da IA e MCPs
   const respostaFinal = await processarResposta(payloadMensagens, isImage, isImage ? attachment.url : null);
-  adicionarAMemoria(channel.id, 'assistant', respostaFinal);
+  adicionarAMemoria(channelId, 'assistant', respostaFinal);
 
   return respostaFinal;
 }
@@ -112,14 +125,13 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // REGEX: Verifica se a mensagem COMEÇA com a menção (@Mimi) ou com a palavra "Mimi"
+  // REGEX: Detecta se a mensagem COMEÇA com a menção (@Mimi) ou com a palavra "Mimi"
   const regexInicioMimi = /^(<@!?\d+>|mimi)\b/i;
 
   if (regexInicioMimi.test(content)) {
-    // Remove a palavra "mimi" ou a menção do INÍCIO da mensagem
     let prompt = content
       .replace(regexInicioMimi, '')
-      .replace(/^[,.:;! ]+/, '') // Remove vírgulas, pontos ou espaços logo após o nome
+      .replace(/^[,.:;! ]+/, '')
       .trim();
 
     try {
@@ -127,6 +139,7 @@ client.on('messageCreate', async (message) => {
 
       const respostaFinal = await processarPromptGeral({
         channel: message.channel,
+        channelId: message.channel.id,
         author: message.author,
         prompt: prompt || 'oii!',
         mentionedChannel: message.mentions.channels.first(),
@@ -161,6 +174,7 @@ client.on('interactionCreate', async (interaction) => {
 
       const respostaFinal = await processarPromptGeral({
         channel: interaction.channel,
+        channelId: interaction.channelId,
         author: interaction.user,
         prompt: prompt,
         mentionedChannel: mentionedChannel,
