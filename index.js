@@ -16,7 +16,7 @@ const client = new Client({
 });
 
 client.once('clientReady', async () => {
-  console.log('🌸 Mimi conectando aos servidores MCP locais do PC...');
+  console.log('🌸 Mimi conectando aos servidores MCP...');
   try {
     await mcpHub.adicionarServidor('files', 'npx', ['-y', '@modelcontextprotocol/server-filesystem', './']);
     if (process.env.BRAVE_API_KEY) {
@@ -24,18 +24,60 @@ client.once('clientReady', async () => {
         BRAVE_API_KEY: process.env.BRAVE_API_KEY
       });
     }
-    console.log(`🌸 Mimi online e organizada! (${mcpHub.ferramentas.length} ferramentas MCP)`);
+    console.log(`🌸 Mimi online e pronta! (${mcpHub.ferramentas.length} ferramentas MCP)`);
   } catch (err) {
-    console.error('⚠️ Aviso na carga de MCPs:', err.message);
+    console.error('⚠️ Erro ao carregar MCPs:', err.message);
   }
 });
 
+// --- FUNÇÃO AUXILIAR PARA PROCESSAR O PROMPT UNIFICADO ---
+async function processarPromptGeral({ channel, author, prompt, mentionedChannel, attachment }) {
+  const isImage = attachment && attachment.contentType && attachment.contentType.startsWith('image/');
+  let promptComContexto = prompt || 'oii!';
+
+  // 1. Leitura de canal opcional
+  if (mentionedChannel) {
+    const permissions = mentionedChannel.permissionsFor(client.user);
+    if (permissions && permissions.has(PermissionFlagsBits.ViewChannel) && permissions.has(PermissionFlagsBits.ReadMessageHistory)) {
+      const history = await mentionedChannel.messages.fetch({ limit: 15 });
+      const formattedMessages = history
+        .map(m => `${m.author.username}: ${m.content} ${m.attachments.size > 0 ? '[mídia]' : ''}`)
+        .reverse()
+        .join('\n');
+
+      promptComContexto = `${prompt}\n\n[HISTÓRICO LIDO DO CANAL #${mentionedChannel.name}]:\n${formattedMessages}\n\nResponda ao usuário com base no histórico acima.`;
+    }
+  }
+
+  // 2. Rolagem de dados de RPG
+  const resultadoDado = tentarRolarDado(prompt);
+  if (resultadoDado) {
+    promptComContexto += `\n\n[SISTEMA DE RPG]: Pedido: ${resultadoDado.qtd}d${resultadoDado.lados}. Resultados: [${resultadoDado.resultados.join(', ')}]. Total: ${resultadoDado.total}.`;
+  }
+
+  // 3. Gestão de Memória de curto prazo
+  adicionarAMemoria(channel.id, 'user', `${author.username}: ${promptComContexto}`);
+
+  const systemPrompt = obterSystemInstruction(author.id);
+  const payloadMensagens = [
+    { role: 'system', content: systemPrompt },
+    ...obterMemoria(channel.id)
+  ];
+
+  // 4. Execução da IA e MCPs
+  const respostaFinal = await processarResposta(payloadMensagens, isImage, isImage ? attachment.url : null);
+  adicionarAMemoria(channel.id, 'assistant', respostaFinal);
+
+  return respostaFinal;
+}
+
+// --- FLUXO 1: MENSAGENS NORMAIS NO CHAT ---
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
   const content = message.content.trim();
 
-  // Comandos administrativos
+  // Comandos administrativos (!limpar e !cargo)
   if (content.startsWith('!limpar')) {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
       return message.reply('você não tem permissão pra apagar as mensagens não, viu? 🌸');
@@ -70,48 +112,26 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // Interação ao mencionar a Mimi
-  if (message.mentions.has(client.user)) {
-    const prompt = content.replace(/<@!?\d+>/g, '').trim();
+  // REGEX: Verifica se a mensagem COMEÇA com a menção (@Mimi) ou com a palavra "Mimi"
+  const regexInicioMimi = /^(<@!?\d+>|mimi)\b/i;
+
+  if (regexInicioMimi.test(content)) {
+    // Remove a palavra "mimi" ou a menção do INÍCIO da mensagem
+    let prompt = content
+      .replace(regexInicioMimi, '')
+      .replace(/^[,.:;! ]+/, '') // Remove vírgulas, pontos ou espaços logo após o nome
+      .trim();
 
     try {
       await message.channel.sendTyping();
 
-      const attachment = message.attachments.first();
-      const isImage = attachment && attachment.contentType && attachment.contentType.startsWith('image/');
-      let promptComContexto = prompt || 'oii!';
-
-      // Leitura de outros canais
-      const mentionedChannel = message.mentions.channels.first();
-      if (mentionedChannel) {
-        const permissions = mentionedChannel.permissionsFor(client.user);
-        if (permissions && permissions.has(PermissionFlagsBits.ViewChannel) && permissions.has(PermissionFlagsBits.ReadMessageHistory)) {
-          const history = await mentionedChannel.messages.fetch({ limit: 15 });
-          const formattedMessages = history
-            .map(m => `${m.author.username}: ${m.content} ${m.attachments.size > 0 ? '[mídia]' : ''}`)
-            .reverse()
-            .join('\n');
-
-          promptComContexto = `${prompt}\n\n[HISTÓRICO LIDO DO CANAL #${mentionedChannel.name}]:\n${formattedMessages}\n\nResponda ao usuário com base no histórico acima.`;
-        }
-      }
-
-      // Rolagem de dados RPG
-      const resultadoDado = tentarRolarDado(prompt);
-      if (resultadoDado) {
-        promptComContexto += `\n\n[SISTEMA DE RPG]: Pedido: ${resultadoDado.qtd}d${resultadoDado.lados}. Resultados: [${resultadoDado.resultados.join(', ')}]. Total: ${resultadoDado.total}.`;
-      }
-
-      adicionarAMemoria(message.channel.id, 'user', `${message.author.username}: ${promptComContexto}`);
-
-      const systemPrompt = obterSystemInstruction(message.author.id);
-      const payloadMensagens = [
-        { role: 'system', content: systemPrompt },
-        ...obterMemoria(message.channel.id)
-      ];
-
-      const respostaFinal = await processarResposta(payloadMensagens, isImage, isImage ? attachment.url : null);
-      adicionarAMemoria(message.channel.id, 'assistant', respostaFinal);
+      const respostaFinal = await processarPromptGeral({
+        channel: message.channel,
+        author: message.author,
+        prompt: prompt || 'oii!',
+        mentionedChannel: message.mentions.channels.first(),
+        attachment: message.attachments.first()
+      });
 
       if (respostaFinal.length > 2000) {
         const chunks = respostaFinal.match(/[\s\S]{1,1900}/g);
@@ -122,8 +142,45 @@ client.on('messageCreate', async (message) => {
         await message.reply(respostaFinal);
       }
     } catch (err) {
-      console.error('Erro na Mimi:', err);
+      console.error('Erro na Mimi (Texto):', err);
       message.reply('eita, deu um probleminha aqui kkkk tenta de novo? 🥺💖');
+    }
+  }
+});
+
+// --- FLUXO 2: SLASH COMMANDS (/mimi) ---
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  if (interaction.commandName === 'mimi') {
+    const prompt = interaction.options.getString('mensagem');
+    const mentionedChannel = interaction.options.getChannel('canal');
+
+    try {
+      await interaction.deferReply();
+
+      const respostaFinal = await processarPromptGeral({
+        channel: interaction.channel,
+        author: interaction.user,
+        prompt: prompt,
+        mentionedChannel: mentionedChannel,
+        attachment: null
+      });
+
+      if (respostaFinal.length > 2000) {
+        const chunks = respostaFinal.match(/[\s\S]{1,1900}/g);
+        await interaction.editReply(chunks[0]);
+        for (let i = 1; i < chunks.length; i++) {
+          await interaction.followUp(chunks[i]);
+        }
+      } else {
+        await interaction.editReply(respostaFinal);
+      }
+    } catch (err) {
+      console.error('Erro no Slash Command da Mimi:', err);
+      if (interaction.deferred) {
+        await interaction.editReply('eita, deu um probleminha aqui kkkk tenta de novo? 🥺💖');
+      }
     }
   }
 });
